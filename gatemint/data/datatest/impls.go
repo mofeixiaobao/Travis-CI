@@ -1,0 +1,238 @@
+// Copyright (C) 2019 Algorand, Inc.
+// This file is part of go-algorand
+//
+// go-algorand is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as
+// published by the Free Software Foundation, either version 3 of the
+// License, or (at your option) any later version.
+//
+// go-algorand is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with go-algorand.  If not, see <https://www.gnu.org/licenses/>.
+
+package datatest
+
+import (
+	"context"
+	"fmt"
+	"github.com/gatechain/gatemint/node"
+	"github.com/gatechain/logging"
+	"time"
+
+	"github.com/gatechain/crypto"
+	"github.com/gatechain/gatemint/agreement"
+	"github.com/gatechain/gatemint/config"
+	"github.com/gatechain/gatemint/data"
+	"github.com/gatechain/gatemint/data/basics"
+	"github.com/gatechain/gatemint/data/bookkeeping"
+	"github.com/gatechain/gatemint/data/committee"
+	"github.com/gatechain/gatemint/protocol"
+)
+
+// This file is a copy of node/impls.go.
+type entryValidatorImpl struct {
+	l *data.Ledger
+}
+
+type validatedBlock struct {
+	blk *bookkeeping.Block
+}
+
+// Validate implements BlockValidator.Validate.
+func (i entryValidatorImpl) Validate(ctx context.Context, period uint64, e bookkeeping.Block) (agreement.ValidatedBlock, error) {
+	ve := validatedBlock{
+		blk: &e,
+	}
+
+	return ve, nil
+}
+
+func (i entryValidatorImpl) TxsAvailabled() <-chan struct{} {
+	return nil
+}
+
+type entryFactoryImpl struct {
+	l *data.Ledger
+}
+
+// AssembleBlock implements Ledger.AssembleBlock.
+func (i entryFactoryImpl) AssembleBlock(round basics.Round, period uint64, deadline time.Time, committeeBottomPeriod uint64) (agreement.ValidatedBlock, error) {
+	prev, err := i.l.BlockHdr(round - 1)
+	if err != nil {
+		return nil, fmt.Errorf("could not make proposals: could not read block from ledger at round %v: %v", round, err)
+	}
+
+	var consensusData bookkeeping.ConsensusData
+	committee := consensusData.Committee
+	equivocations := consensusData.Equivocations
+
+	if round > 2 {
+		lastBlockCertificate, err := i.l.CertificateSelect(round - 1)
+		if err != nil {
+			return nil, fmt.Errorf("could not make proposals at round %d: could not get last certificate from ledger: %v", round, err)
+		}
+		certEquivocations := lastBlockCertificate.EquivocationVotes
+		for _, certEquivocation := range certEquivocations {
+			newCertEquivocation, err := node.ConvertEquivocationVoteType(certEquivocation)
+			if err == nil {
+				equivocations.CertEquivocations = append(equivocations.CertEquivocations, newCertEquivocation)
+			} else {
+				logging.Base().Warnf("newCertEquivocation type convert error", err)
+			}
+		}
+		// add committeePropose
+		if period < committeeBottomPeriod {
+			for _, proposeAddress := range lastBlockCertificate.ProposerList {
+				proposerPower := uint64(1)
+				committee = append(committee, bookkeeping.CommitteeSingle{CommitteeAddress: proposeAddress, CommitteePower: proposerPower, CommitteeType: 0})
+			}
+		} else {
+			proposerPower := uint64(1)
+			committee = append(committee, bookkeeping.CommitteeSingle{CommitteeAddress: lastBlockCertificate.Proposal.OriginalProposer, CommitteePower: proposerPower, CommitteeType: 0})
+		}
+		// end add committeePropose
+	} else if round == 2 {
+		lastBlockCertificate, err := i.l.CertificateSelect(round - 1)
+		if err != nil {
+			return nil, fmt.Errorf("could not make proposals at round %d: could not get last certificate from ledger: %v", round, err)
+		}
+		//proposerPower := i.getBalancePower(round-1, lastBlockCertificate.Proposal.OriginalProposer)
+		proposerPower := uint64(1)
+		committee = append(committee, bookkeeping.CommitteeSingle{CommitteeAddress: lastBlockCertificate.Proposal.OriginalProposer, CommitteePower: proposerPower, CommitteeType: 0})
+
+	}
+	var proposer basics.Address
+	appState, err := i.l.AppState(round - 1)
+	b := bookkeeping.MakeBlock(prev, committee, equivocations, proposer, appState)
+	b.RewardsState = prev.RewardsState
+	return validatedBlock{blk: &b}, nil
+}
+
+func (i entryFactoryImpl) getBalancePower(round basics.Round, address basics.Address) uint64 {
+	var balancePower uint64
+	balancePower = 1
+	record, err := i.l.BalanceRecord(round, address)
+	if err != nil {
+		logging.Base().Errorf("Failed to obtain balance record for address %v in round %v: %v", address, round)
+	} else {
+		balancePower = record.Power.Raw
+	}
+	return balancePower
+}
+
+// WithSeed implements the agreement.ValidatedBlock interface.
+func (ve validatedBlock) WithSeed(s committee.Seed) agreement.ValidatedBlock {
+	newblock := ve.blk.WithSeed(s)
+	return validatedBlock{blk: &newblock}
+}
+
+// Block implements the agreement.ValidatedBlock interface.
+func (ve validatedBlock) Block() bookkeeping.Block {
+	return *ve.blk
+}
+
+type ledgerImpl struct {
+	l *data.Ledger
+}
+
+// NextRound implements Ledger.NextRound.
+func (i ledgerImpl) NextRound() basics.Round {
+	return i.l.NextRound()
+}
+
+func (i ledgerImpl) Seed(r basics.Round) (committee.Seed, error) {
+	block, err := i.l.BlockHdr(r)
+	if err != nil {
+		return committee.Seed{}, err
+	}
+	return block.Seed, nil
+}
+
+func (i ledgerImpl) LookupDigest(r basics.Round) (crypto.Digest, error) {
+	blockhdr, err := i.l.BlockHdr(r)
+	if err != nil {
+		return crypto.Digest{}, err
+	}
+	return crypto.Digest(blockhdr.Hash()), nil
+}
+
+// BalanceRecord implements Ledger.BalanceRecord.
+func (i ledgerImpl) BalanceRecord(r basics.Round, addr basics.Address) (basics.BalanceRecord, error) {
+	return i.l.BalanceRecord(r, addr)
+}
+
+// Circulation implements Ledger.Circulation.
+func (i ledgerImpl) Circulation(r basics.Round, addr basics.Address) (basics.Power, basics.BalanceRecord, error) {
+	return i.l.Circulation(r, addr)
+}
+
+// Wait implements Ledger.Wait.
+func (i ledgerImpl) Wait(r basics.Round) chan struct{} {
+	return i.l.Wait(r)
+}
+
+// EnsureValidatedBlock implements Ledger.EnsureValidatedBlock.
+func (i ledgerImpl) EnsureValidatedBlock(e agreement.ValidatedBlock, c agreement.Certificate) {
+	i.l.EnsureBlock(e.(validatedBlock).blk, c)
+}
+
+// EnsureBlock implements Ledger.EnsureBlock.
+func (i ledgerImpl) EnsureBlock(e bookkeeping.Block, c agreement.Certificate) {
+	i.l.EnsureBlock(&e, c)
+}
+
+// ConsensusParams implements Ledger.ConsensusParams.
+func (i ledgerImpl) ConsensusParams(r basics.Round) (config.ConsensusParams, error) {
+	return i.l.ConsensusParams(r)
+}
+
+// ConsensusParams implements Ledger.ConsensusVersion.
+func (i ledgerImpl) ConsensusVersion(r basics.Round) (protocol.ConsensusVersion, error) {
+	return i.l.ConsensusVersion(r)
+}
+
+// EnsureDigest implements Ledger.EnsureDigest.
+func (i ledgerImpl) EnsureDigest(cert agreement.Certificate, quit chan struct{}, verifier *agreement.AsyncVoteVerifier) {
+	r := cert.Round
+	consistencyCheck := func() bool {
+		if r < i.NextRound() {
+			b, err := i.l.Block(r)
+			if err != nil {
+				panic(err)
+			}
+
+			if b.Digest() != cert.Proposal.BlockDigest {
+				err := fmt.Errorf("testLedger.EnsureDigest called with conflicting entries in round %v", r)
+				panic(err)
+			}
+			return true
+		}
+		return false
+	}
+
+	if consistencyCheck() {
+		return
+	}
+
+	select {
+	case <-quit:
+		return
+	case <-i.Wait(r):
+		if !consistencyCheck() {
+			err := fmt.Errorf("Wait channel fired without matching block in round %v", r)
+			panic(err)
+		}
+	}
+}
+
+func (i ledgerImpl) CertificateSave(certificate agreement.Certificate) {
+	i.l.CertificateSave(certificate)
+}
+
+func (i ledgerImpl) UnauthenticatedCertificateSave(unauthenticatedCertificate agreement.UnauthenticatedCertificate) {
+	i.l.UnauthenticatedCertificateSave(unauthenticatedCertificate)
+}
