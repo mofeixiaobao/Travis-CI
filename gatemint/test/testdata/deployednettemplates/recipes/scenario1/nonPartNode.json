@@ -1,5 +1,0 @@
-{
-    "APIEndpoint": "{{APIEndpoint}}",
-    "APIToken": "{{APIToken}}",
-    "ConfigJSONOverride": "{ \"DNSBootstrapID\": \"<network>.algodev.network\", \"DeadlockDetection\": -1, \"BaseLoggerDebugLevel\": 4  }"
-}
