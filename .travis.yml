@@ -1,4 +1,4 @@
 language: go
 rvm:
- - 1.13
+ - go1.13
  - go test
